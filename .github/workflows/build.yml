@@ -1,0 +1,185 @@
+name: Build Nura image (POCO X3 Pro / vayu)
+
+on:
+  workflow_dispatch:
+    inputs:
+      panel:
+        description: "Display panel (tianma / huaxing / both)"
+        type: choice
+        options: [both, tianma, huaxing]
+        default: both
+      ui:
+        description: "User interface"
+        type: choice
+        options: [phosh, plasma-mobile, gnome-mobile, sxmo-de-sway, console]
+        default: phosh
+      channel:
+        description: "Nura channel (edge = rolling, vXX.YY = release)"
+        type: choice
+        options: [edge, v26.06]
+        default: edge
+      ui_extras:
+        description: "Install UI extras"
+        type: boolean
+        default: false
+      extra_packages:
+        description: "Extra packages (space separated, e.g. 'htop vim tmux')"
+        type: string
+        default: ""
+      filesystem:
+        description: "Root filesystem"
+        type: choice
+        options: [ext4, f2fs, btrfs]
+        default: ext4
+      password:
+        description: "Initial PIN/password (ignored if secret NURA_PASSWORD is set)"
+        type: string
+        default: "147147"
+      runner:
+        description: "Runner (arm = native & fast, x86 = qemu emulation & slow)"
+        type: choice
+        options: [ubuntu-24.04-arm, ubuntu-24.04]
+        default: ubuntu-24.04-arm
+      release:
+        description: "Publish as GitHub Release"
+        type: boolean
+        default: true
+  # Optional: automatic weekly build (Monday 03:17 UTC) with the defaults above
+  # schedule:
+  #   - cron: "17 3 * * 1"
+
+concurrency:
+  group: nura-vayu-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  setup:
+    runs-on: ubuntu-24.04
+    outputs:
+      panels: ${{ steps.m.outputs.panels }}
+      runner: ${{ steps.m.outputs.runner }}
+      tag: ${{ steps.m.outputs.tag }}
+    steps:
+      - id: m
+        run: |
+          panel="${{ inputs.panel || 'both' }}"
+          if [ "$panel" = "both" ]; then
+            echo 'panels=["tianma","huaxing"]' >> "$GITHUB_OUTPUT"
+          else
+            echo "panels=[\"$panel\"]" >> "$GITHUB_OUTPUT"
+          fi
+          echo "runner=${{ inputs.runner || 'ubuntu-24.04-arm' }}" >> "$GITHUB_OUTPUT"
+          echo "tag=nura-vayu-${{ inputs.ui || 'phosh' }}-${{ inputs.channel || 'edge' }}-$(date -u +%Y%m%d)-r${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: setup
+    name: build (${{ matrix.panel }})
+    runs-on: ${{ needs.setup.outputs.runner }}
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        panel: ${{ fromJSON(needs.setup.outputs.panels) }}
+    env:
+      PANEL: ${{ matrix.panel }}
+      UI: ${{ inputs.ui || 'phosh' }}
+      CHANNEL: ${{ inputs.channel || 'edge' }}
+      UI_EXTRAS: ${{ inputs.ui_extras && 'true' || 'false' }}
+      EXTRA_PACKAGES: ${{ inputs.extra_packages }}
+      FILESYSTEM: ${{ inputs.filesystem || 'ext4' }}
+      NURA_PASSWORD: ${{ secrets.NURA_PASSWORD || inputs.password || '147147' }}
+      COMPRESS: zstd
+      BUILD_DIR: ${{ github.workspace }}/build
+      OUT_DIR: ${{ github.workspace }}/out
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
+          sudo docker image prune -af >/dev/null 2>&1 || true
+          df -h /
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq git python3 openssl kpartx util-linux \
+               procps coreutils zstd xz-utils
+
+      - name: Build image
+        id: build
+        run: |
+          chmod +x build.sh flash.sh
+          ./build.sh
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.build.outputs.image_name }}
+          path: |
+            ${{ steps.build.outputs.archive }}
+            ${{ steps.build.outputs.archive }}.sha256
+          compression-level: 0
+          retention-days: 14
+          if-no-files-found: error
+
+      - name: Upload pmbootstrap log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pmbootstrap-log-${{ matrix.panel }}
+          path: build/work/log.txt
+          if-no-files-found: ignore
+
+  release:
+    needs: [setup, build]
+    if: ${{ inputs.release }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: nura-xiaomi-vayu-*
+          merge-multiple: true
+
+      - name: Release notes
+        run: |
+          ls -lh dist
+          {
+            echo "Nura (formerly postmarketOS) for the **Xiaomi POCO X3 Pro (vayu)**"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| UI | \`${{ inputs.ui }}\` |"
+            echo "| Channel | \`${{ inputs.channel }}\` |"
+            echo "| Filesystem | \`${{ inputs.filesystem }}\` |"
+            echo "| Build run | [#${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) |"
+            echo
+            echo "Pick the archive matching your **display panel** (\`tianma\` or \`huaxing\`, see README)."
+            echo
+            echo '```bash'
+            echo 'zstd -dc nura-xiaomi-vayu-<panel>-*.tar.zst | tar -xf -'
+            echo 'cd nura-xiaomi-vayu-<panel>-*/ && ./flash.sh'
+            echo '```'
+            echo
+            echo "Default PIN/password: \`147147\` unless changed at build time — change it with \`passwd\`."
+            echo
+            echo "⚠️ Flashing \`userdata\` erases everything on the phone."
+          } > notes.md
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.setup.outputs.tag }}
+          name: ${{ needs.setup.outputs.tag }}
+          body_path: notes.md
+          prerelease: ${{ inputs.channel == 'edge' }}
+          files: dist/*
